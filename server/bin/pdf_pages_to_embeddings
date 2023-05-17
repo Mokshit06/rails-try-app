@@ -1,0 +1,97 @@
+#!/usr/bin/env ruby
+
+require "dotenv/load"
+require "openai"
+require "optparse"
+require "rover-df"
+require "tokenizers"
+require "pdf-reader"
+require "csv"
+
+@client = OpenAI::Client.new(access_token: ENV["ACCESS_TOKEN"])
+
+COMPLETIONS_MODEL = "text-davinci-003"
+MODEL_NAME = "curie"
+DOC_EMBEDDING_MODEL = "text-search-#{MODEL_NAME}-doc-001"
+
+options = {}
+OptionParser
+  .new do |opts|
+  opts.on("--pdf [PDF]", "Name of PDF") { |v| options[:pdf] = v }
+end
+  .parse!
+
+filename = options[:pdf]
+
+reader = PDF::Reader.new(filename)
+
+@tokenizer = Tokenizers.from_pretrained("gpt2")
+
+def count_tokens(text)
+  encoded = @tokenizer.encode(text)
+  return encoded.tokens.length
+end
+
+def extract_pages(page_text, index)
+  if page_text.length == 0
+    return {}
+  else
+    contents = page_text.split(" ").join(" ")
+    outputs = {
+      title: "Page #{index}",
+      content: contents,
+      tokens: count_tokens(contents) + 4,
+    }
+    return outputs
+  end
+end
+
+res = []
+index = []
+reader.pages.each_with_index do |page, i|
+  res.append(extract_pages(page.text, i + 1))
+  index.append(i)
+end
+
+df = Rover::DataFrame.new(res)
+df = df[df[:tokens] < 2046]
+
+File.open("#{filename}.pages.csv", "w") do |file|
+  file.write(df.to_csv)
+end
+
+def get_embedding(text, model)
+  result = @client.embeddings(
+    parameters: {
+      model: model,
+      input: text,
+    },
+  )
+
+  return result["data"][0]["embedding"]
+end
+
+def get_doc_embedding(text)
+  return get_embedding(text, DOC_EMBEDDING_MODEL)
+end
+
+def compute_doc_embeddings(df)
+  i = 0
+  embeddings = []
+
+  df.each_row do |row|
+    embeddings.append([i, get_doc_embedding(row[:content])])
+    i += 1
+  end
+
+  return embeddings
+end
+
+doc_embeddings = compute_doc_embeddings(df)
+
+CSV.open("#{filename}.embeddings.csv", "w") do |csv|
+  csv << ["title"] + (0..4096).to_a
+  doc_embeddings.each do |i, embedding|
+    csv << ["Page " + (i + 1).to_s] + embedding
+  end
+end
